@@ -1,0 +1,40 @@
+samples:
+  test1:
+    coordinates_file: demo/coordinate_file.txt
+    target_ref_file: demo/testasm/NA20355_chr16_haplotype2-0000183.fa
+    second_assembly_file: demo/testasm/NA20355_chr16_h2tg000041l#1-37317985.fa
+    hifi_reads_dir: demo/reads
+    hifi_reads_suffix: hifi.fa
+    nucflag_hifi_preset: hifi
+    ont_reads_dir: demo/reads
+    ont_reads_suffix: ont.fa
+    nucflag_ont_preset: ont_r9
+  
+  test2:
+    coordinates_file: demo/coordinate_file.txt
+    target_ref_file: demo/testasm/NA20355_chr16_haplotype2-0000183.fa
+    second_assembly_file: demo/testasm/NA20355_chr16_h2tg000041l#1-37317985.fa
+    hifi_reads_dir: demo/reads
+    hifi_reads_suffix: hifi.fa
+    nucflag_hifi_preset: hifi
+    ont_reads_dir: demo/reads
+    ont_reads_suffix: ont.fa
+    nucflag_ont_preset: ont_r9
+
+outdir: results
+nucflag_filter: "correct,softclip,homopolymer,dinucleotide,simple_repeat"
+threads: 24
+mem_aln: 100GB
+MAPQ_thr: 20
+kmer_size: 5000
+kmer_number: 2000
+extend_length: 10000
+break_contig_merge_thr: 5000
+min_array_thr: 100000
+overlap_merge_thr: 0.3
+merge_distance: 500000
+rollback: 1
+logs_dir: logs
+bmks_dir: bmks
+
+

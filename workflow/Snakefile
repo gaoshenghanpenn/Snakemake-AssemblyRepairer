@@ -1,0 +1,367 @@
+import os
+
+# ==============================================================================
+# 1. Config & Global Variables
+# ==============================================================================
+SAMPLES = list(config.get("samples", {}).keys())
+
+# 全局参数提取
+OUTDIR = config.get("outdir", "results")
+LOGS_DIR = config.get("logs_dir", "logs")
+BMKS_DIR = config.get("bmks_dir", "bmks")
+
+THREADS_ALN = int(config.get("threads", 1))
+MEM_ALN = str(config.get("mem_aln", "10GB"))
+
+nucflag_filter = config.get("nucflag_filter", "")
+MAPQ_thr = config.get("MAPQ_thr", 20)
+break_contig_merge_thr = config.get("break_contig_merge_thr", 5000)
+min_array_thr = config.get("min_array_thr", 100000)
+overlap_merge_thr = config.get("overlap_merge_thr", 0.3)
+kmer_size = config.get("kmer_size", 5000)
+kmer_number = config.get("kmer_number", 2000)
+extend_length = config.get("extend_length", 10000)
+merge_distance = config.get("merge_distance", 500000)
+rollback_mode = int(config.get("rollback", 1))
+
+# ==============================================================================
+# Helper Functions: 获取特定样本的配置
+# ==============================================================================
+def get_sample_val(sample, key, default=None):
+    return config.get("samples", {}).get(sample, {}).get(key, default)
+
+def get_target_ref(wildcards):
+    return get_sample_val(wildcards.sample, "target_ref_file")
+
+def get_second_asm(wildcards):
+    return get_sample_val(wildcards.sample, "second_assembly_file")
+
+
+# ==============================================================================
+# 2. Module: Initial Target NucFlag
+# ==============================================================================
+target_cfg = config.copy()
+target_cfg.update({
+    "running_type": "nucflag_init_target",
+    "ref_file_key": "target_ref_file",
+    "coords_file_key": "coordinates_file"
+})
+
+module run_target_NucFlag:
+    snakefile: "rules/run_nucflag.smk"
+    config: target_cfg
+
+use rule * from run_target_NucFlag as target_*
+
+
+# ==============================================================================
+# 3. Rule: Get Target Region
+# ==============================================================================
+rule run_get_target_and_second_region:
+    input:
+        target_ref_file = get_target_ref,
+        second_assembly_file = get_second_asm,
+        error_dir = rules.target_merge_nucflag_errors.output.merged_dir,
+    output:
+        error_coordinates_file = os.path.join(OUTDIR, "{sample}", 'error_cen_array_list.bed'),
+        target_cen_array = directory(os.path.join(OUTDIR, "{sample}", 'target_cen_array')),
+        paf_file = os.path.join(OUTDIR, "{sample}", 'all.cenarray.fa.paf'),
+        matching_records_file = os.path.join(OUTDIR, "{sample}", 'cenpairs.xls'),
+        second_asm_array_bed = os.path.join(OUTDIR, "{sample}", 'second_asm_array.nucflag.bed'),
+        repair_table = os.path.join(OUTDIR, "{sample}", 'region_match.all.xls'),
+        second_asm_array = directory(os.path.join(OUTDIR, "{sample}", 'second_asm_array'))
+    threads: THREADS_ALN
+    conda:
+        "envs/env.yaml"
+    resources:
+        mem = MEM_ALN
+    log:
+        os.path.join(LOGS_DIR, "{sample}", "run_get_target_and_second_region.log")
+    benchmark:
+        os.path.join(BMKS_DIR, "{sample}", "run_get_target_and_second_region.tsv")
+    params:
+        outdir = lambda w: os.path.join(OUTDIR, w.sample),
+        MAPQ_thr = MAPQ_thr,
+        break_contig_merge_thr = break_contig_merge_thr,
+        min_array_thr = min_array_thr,
+        overlap_merge_thr = overlap_merge_thr,
+    shell:
+        """
+        python workflow/script/getTargetRegionAndSecondRegion.py \
+            -tr {input.target_ref_file} \
+            -sr {input.second_assembly_file} \
+            -e {input.error_dir} \
+            -mt {threads} \
+            -mq {params.MAPQ_thr} \
+            -bc {params.break_contig_merge_thr} \
+            -ma {params.min_array_thr} \
+            -om {params.overlap_merge_thr} \
+            -o {params.outdir} 2> {log}
+        """
+
+# ==============================================================================
+# 4. Module: Second NucFlag
+# ==============================================================================
+second_cfg = config.copy()
+second_cfg.update({
+    "running_type": "nucflag_second_asm",
+    "ref_file_key": "second_assembly_file",
+    "coords_file_template": os.path.join(OUTDIR, "{sample}", 'second_asm_array.nucflag.bed')
+})
+
+module run_second_NucFlag:
+    snakefile: "rules/run_nucflag.smk"
+    config: second_cfg
+ 
+use rule * from run_second_NucFlag as second_*
+
+# ==============================================================================
+# 5. Checkpoint & Repair
+# ==============================================================================
+checkpoint split_repair_task:
+    input:
+        match_file = rules.run_get_target_and_second_region.output.repair_table,
+    output:
+        split_dir = directory(os.path.join(OUTDIR, "{sample}", "out_repair"))
+    run:
+        import os
+
+        if not os.path.exists(output.split_dir):
+            os.makedirs(output.split_dir)
+
+        contigs_repair_record = {}
+
+        with open(input.match_file, 'r') as f:
+            while True:
+                line = f.readline()[:-1]
+                if not line:
+                    break
+                items = line.split('\t')
+                name = items[0] + ':' + items[1] + '-' + items[2] + '@' + items[3]
+                if name not in contigs_repair_record:
+                    contigs_repair_record[name] = [line]
+                else:
+                    contigs_repair_record[name].append(line)
+        
+        for name in contigs_repair_record.keys():
+            out_repair_file_name = os.path.join(output.split_dir, f"{name}.repair.xls")
+            with open(out_repair_file_name, 'w') as out_repair_file:
+                for j in contigs_repair_record[name]:
+                    out_repair_file.write(j + '\n')
+
+
+rule run_single_repair_job:
+    input:
+        repair_xls = os.path.join(OUTDIR, "{sample}", "out_repair", "{name}.repair.xls"),
+        target_cen_array = lambda w: os.path.join(OUTDIR, w.sample, "target_cen_array", w.name.split('@')[0] + ".fa"),
+        second_asm_array = rules.run_get_target_and_second_region.output.second_asm_array,
+        error_dir = rules.target_merge_nucflag_errors.output.merged_dir,
+        second_error_dir = rules.second_merge_nucflag_errors.output.merged_dir
+    output:
+        repaired_fa = os.path.join(OUTDIR, "{sample}", "repaired_results", "{name}.repaired.fa"),
+        repaired_log = os.path.join(OUTDIR, "{sample}", "repaired_results", "{name}.repaired.log")
+    log:
+        os.path.join(LOGS_DIR, "{sample}", "run_single_repair_job", "{name}.log")
+    benchmark:
+        os.path.join(BMKS_DIR, "{sample}", "run_single_repair_job", "{name}.tsv")
+    params:
+        kmer_size = kmer_size,
+        kmer_number = kmer_number,
+        extend_length = extend_length,
+        out_dir = lambda w: os.path.join(OUTDIR, w.sample, "repaired_results") 
+    threads: 1
+    shell:
+        """
+        REGION=$(echo "{wildcards.name}" | cut -d'@' -f1)
+        FLAG=$(echo "{wildcards.name}" | cut -d'@' -f2)
+        
+        ERROR_FILE="{input.error_dir}/$REGION.xls"
+
+        if [ ! -f "$ERROR_FILE" ]; then
+            ERROR_FILE="-1"
+        fi
+
+        python workflow/script/region_repairment.py \
+            -r {input.repair_xls} \
+            -ts {input.target_cen_array} \
+            -tf "$FLAG" \
+            -te "$ERROR_FILE" \
+            -ssd {input.second_asm_array} \
+            -sed {input.second_error_dir} \
+            -omd {params.out_dir} \
+            -os {output.repaired_fa} \
+            -ol {output.repaired_log} \
+            -k {params.kmer_size} \
+            -kn {params.kmer_number} \
+            -et {params.extend_length} 2> {log}
+        """
+
+def get_repair_targets(wildcards):
+    checkpoint_output = checkpoints.split_repair_task.get(sample=wildcards.sample).output.split_dir
+    names, = glob_wildcards(os.path.join(checkpoint_output, "{name}.repair.xls"))
+    return expand(os.path.join(OUTDIR, "{sample}", "repaired_results", "{name}.repaired.fa"), sample=wildcards.sample, name=names)
+
+rule merge_and_repair_assembly:
+    input:
+        target_ref = get_target_ref,
+        repaired_fragments = get_repair_targets
+    output:
+        out_bed = os.path.join(OUTDIR, "{sample}", 'repaired.bed'),
+        out_fa  = os.path.join(OUTDIR, "{sample}", 'repaired_assembly.fa')
+    log:
+        os.path.join(LOGS_DIR, "{sample}", "merge_and_repair_assembly.log")
+    benchmark:
+        os.path.join(BMKS_DIR, "{sample}", "merge_and_repair_assembly.tsv")
+    params:
+        repair_dir = lambda w: os.path.join(OUTDIR, w.sample, "repaired_results"),
+        out_dir_path = lambda w: os.path.join(OUTDIR, w.sample)
+    threads: 1
+    shell:
+        """
+        python workflow/script/repair_assembly.py \
+            -r {input.target_ref} \
+            -a {params.repair_dir} \
+            -o {params.out_dir_path} \
+            -or {output.out_bed} \
+            -of {output.out_fa} 2> {log}
+        """
+
+# ==============================================================================
+# 6. Module: Repaired Assembly NucFlag
+# ==============================================================================
+repaired_cfg = config.copy()
+repaired_cfg.update({
+    "running_type": "nucflag_repaired_asm",
+    "ref_file_template": os.path.join(OUTDIR, "{sample}", 'repaired_assembly.fa'),
+    "coords_file_template": os.path.join(OUTDIR, "{sample}", 'repaired.bed')
+})
+
+module run_repaired_NucFlag:
+    snakefile: "rules/run_nucflag.smk"
+    config: repaired_cfg
+ 
+use rule * from run_repaired_NucFlag as repaired_*
+
+# ==============================================================================
+# 7. Rollback (optional)
+# ==============================================================================
+rule get_rollback_info:
+    input:
+        repair_bed = rules.merge_and_repair_assembly.output.out_bed,
+        old_region_error_dir = rules.target_merge_nucflag_errors.output.merged_dir,
+        new_region_error_dir = rules.repaired_merge_nucflag_errors.output.merged_dir,
+    output:
+        out_rollback_bed = os.path.join(OUTDIR, "{sample}", 'rollback.bed'),
+    log:
+        os.path.join(LOGS_DIR, "{sample}", "get_rollback_info.log")
+    benchmark:
+        os.path.join(BMKS_DIR, "{sample}", "get_rollback_info.tsv") 
+    threads: 1
+    shell:
+        """
+        python workflow/script/make_roll_back.py \
+            -r {input.repair_bed} \
+            -or {input.old_region_error_dir} \
+            -nr {input.new_region_error_dir} \
+            -o {output.out_rollback_bed} 2> {log}
+        """
+
+rule run_rollback:
+    input:
+        rollback_bed = rules.get_rollback_info.output.out_rollback_bed,
+        target_ref = get_target_ref,
+        repaired_fragments = get_repair_targets,
+    output:
+        repaired_assembly = os.path.join(OUTDIR, "{sample}", 'repaired_assembly.afterRB.fa'),
+        final_bed = os.path.join(OUTDIR, "{sample}", 'repaired.afterRB.bed')
+    log:
+        os.path.join(LOGS_DIR, "{sample}", "run_rollback.log")
+    benchmark:
+        os.path.join(BMKS_DIR, "{sample}", "run_rollback.tsv")
+    params:
+        outdir = lambda w: os.path.join(OUTDIR, w.sample),
+        repairdir = lambda w: os.path.join(OUTDIR, w.sample, "repaired_results"),
+    threads: 1
+    shell:
+        """
+        python workflow/script/rollback.py \
+            -rb {input.rollback_bed} \
+            -r {input.target_ref} \
+            -a {params.repairdir} \
+            -o {params.outdir} \
+            -or {output.final_bed} \
+            -of {output.repaired_assembly} 2> {log}
+        """
+
+# ==============================================================================
+# 8. Module: AfterRB Assembly NucFlag
+# ==============================================================================
+afterRB_cfg = config.copy()
+afterRB_cfg.update({
+    "running_type": "nucflag_afterRB_asm",
+    "ref_file_template": os.path.join(OUTDIR, "{sample}", 'repaired_assembly.afterRB.fa'),
+    "coords_file_template": os.path.join(OUTDIR, "{sample}", 'repaired.afterRB.bed')
+})
+
+module run_afterRB_NucFlag:
+    snakefile: "rules/run_nucflag.smk"
+    config: afterRB_cfg
+ 
+use rule * from run_afterRB_NucFlag as afterRB_*
+
+# ==============================================================================
+# 9. Make QC report
+# ==============================================================================
+def get_final_error_source(wildcards):
+    if rollback_mode == 1:
+        return rules.afterRB_merge_nucflag_errors.output.merged_dir
+    else:
+        return rules.repaired_merge_nucflag_errors.output.merged_dir
+
+def get_region_source(wildcards):
+    if rollback_mode == 1:
+        return rules.run_rollback.output.final_bed
+    else:
+        return rules.merge_and_repair_assembly.output.out_bed
+
+rule get_QC_report:
+    input:
+        target_nucflag = rules.target_merge_nucflag_errors.output.merged_dir,
+        final_nucflag = get_final_error_source,
+        region_source = get_region_source,
+    output:
+        qc_report = os.path.join(OUTDIR, "{sample}", 'QC_report.xls')
+    log:
+        os.path.join(LOGS_DIR, "{sample}", "get_QC_report.log")
+    benchmark:
+        os.path.join(BMKS_DIR, "{sample}", "get_QC_report.tsv") 
+    threads: 1
+    shell:
+        """
+        python workflow/script/make_QC_report.py \
+            -r {input.region_source} \
+            -tn {input.target_nucflag} \
+            -an {input.final_nucflag} \
+            -o {output.qc_report} 2> {log}
+        """
+
+# ==============================================================================
+# 10. Final Targets & Rule All
+# ==============================================================================
+def get_all_targets():
+    targets = []
+    targets.extend(expand(os.path.join(OUTDIR, "{sample}", 'QC_report.xls'), sample=SAMPLES))
+    
+    if rollback_mode == 1:
+        targets.extend(expand(os.path.join(OUTDIR, "{sample}", 'repaired_assembly.afterRB.fa'), sample=SAMPLES))
+        targets.extend(expand(rules.afterRB_merge_nucflag_errors.output.merged_dir, sample=SAMPLES))
+    else:
+        targets.extend(expand(os.path.join(OUTDIR, "{sample}", 'repaired_assembly.fa'), sample=SAMPLES))
+        targets.extend(expand(rules.repaired_merge_nucflag_errors.output.merged_dir, sample=SAMPLES))
+        
+    return targets
+
+rule all:
+    input:
+        get_all_targets()
+    default_target: True
